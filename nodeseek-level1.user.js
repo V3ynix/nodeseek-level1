@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NodeSeek 一级及以下标记与屏蔽
 // @namespace    nodeseek-level1
-// @version      1.0.3
+// @version      1.0.4
 // @description  标记 Lv.0、Lv.1 作者；帖子、评论独立屏蔽开关，默认仅标记。
 // @author       V3ynix
 // @license      MIT
@@ -21,7 +21,8 @@
  * 「帖子」覆盖列表主题和打开后的主楼，不影响其他人的评论。
  * 「评论」只作用于回复。关闭开关立即恢复，站内拉黑列表不会被修改。
  * 等级仅按官方 getInfo 接口 detail.rank 判断，Lv.0 和 Lv.1 纳入范围，未知等级不屏蔽。
- * 每个 UID 在本页只查询一次；成功结果在当前标签页缓存 30 分钟。
+ * 同一个 UID 在本页共用查询；临时错误最多重试两次，成功结果缓存 30 分钟。
+ * 1.0.4：全页面查询失败退避恢复，服务异常时降至单路并暂停队列，持续失败仍保留内容。
  * 1.0.3：四路有界查询，移除固定空等；仅更新变化节点，合并统计刷新。
  * 1.0.2：添加 GitHub 安装、更新地址和 MIT 许可元数据。
  * 1.0.1：标记、屏蔽和统计统一覆盖一级及以下；徽标显示实际等级。
@@ -41,9 +42,12 @@
   const queue = [];
   const dirty = new Set();
   let active = 0;
+  let concurrency = 4;
   let scanTimer;
   let cacheTimer;
   let statusTimer;
+  let pauseUntil = 0;
+  let pumpTimer;
   let storageWarning = '';
   let settings = loadSettings();
 
@@ -178,17 +182,45 @@
     const cached = ranks.get(uid);
     if (cached && Date.now() - cached.time < TTL) return Promise.resolve(cached.rank);
     if (pending.has(uid)) return pending.get(uid);
-    const promise = new Promise(resolve => queue.push({ uid, resolve }));
+    const promise = new Promise(resolve => queue.push({ uid, resolve, attempt: 0 }));
     pending.set(uid, promise);
     pump();
     return promise;
   }
 
   function pump() {
-    while (active < 4 && queue.length) {
+    if (pumpTimer !== undefined || !queue.length) return;
+    const wait = pauseUntil - Date.now();
+    if (wait > 0) {
+      pumpTimer = setTimeout(() => {
+        pumpTimer = undefined;
+        pump();
+      }, Math.min(wait, 2147483647));
+      return;
+    }
+    while (active < concurrency && queue.length) {
       const task = queue.shift();
       active++;
-      queryRank(task.uid).then(task.resolve).finally(() => {
+      queryRank(task.uid).then(task.resolve, error => {
+        const transient = error.status === 429 || (error.status >= 500 && error.status < 600) ||
+          error.name === 'TypeError' || error.name === 'AbortError';
+        if (transient) {
+          concurrency = 1;
+          const seconds = Number(error.retryAfter);
+          const requestedDelay = error.retryAfter
+            ? (Number.isFinite(seconds) ? seconds * 1000 : Date.parse(error.retryAfter) - Date.now()) : 0;
+          const delay = Math.max(1000 * 2 ** task.attempt,
+            Number.isFinite(requestedDelay) ? requestedDelay : 0);
+          pauseUntil = Math.max(pauseUntil, Date.now() + delay);
+        }
+        if (transient && task.attempt < 2) {
+          task.attempt++;
+          queue.unshift(task);
+        } else {
+          console.warn(`[NodeSeek Lv.0 / Lv.1] UID ${task.uid} 等级查询失败，保留内容。`, error);
+          task.resolve(null);
+        }
+      }).finally(() => {
         active--;
         pump();
       });
@@ -202,7 +234,12 @@
       const response = await fetch(`/api/account/getInfo/${uid}`, {
         credentials: 'same-origin', signal: controller.signal,
       });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (!response.ok) {
+        const error = new Error(`HTTP ${response.status}`);
+        error.status = response.status;
+        error.retryAfter = response.headers.get('Retry-After');
+        throw error;
+      }
       const data = await response.json();
       if (data.success !== true || !Number.isInteger(data.detail?.rank) || data.detail.rank < 0 ||
           String(data.detail.member_id) !== uid) throw new Error('Invalid account rank');
@@ -210,9 +247,6 @@
       ranks.set(uid, { rank, time: Date.now() });
       saveCache();
       return rank;
-    } catch (error) {
-      console.warn(`[NodeSeek Lv.0 / Lv.1] UID ${uid} 等级查询失败，保留内容。`, error);
-      return null;
     } finally {
       clearTimeout(timer);
     }
