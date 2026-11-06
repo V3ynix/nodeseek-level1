@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NodeSeek 一级及以下标记与屏蔽
 // @namespace    nodeseek-level1
-// @version      1.0.2
+// @version      1.0.3
 // @description  标记 Lv.0、Lv.1 作者；帖子、评论独立屏蔽开关，默认仅标记。
 // @author       V3ynix
 // @license      MIT
@@ -22,6 +22,7 @@
  * 「评论」只作用于回复。关闭开关立即恢复，站内拉黑列表不会被修改。
  * 等级仅按官方 getInfo 接口 detail.rank 判断，Lv.0 和 Lv.1 纳入范围，未知等级不屏蔽。
  * 每个 UID 在本页只查询一次；成功结果在当前标签页缓存 30 分钟。
+ * 1.0.3：四路有界查询，移除固定空等；仅更新变化节点，合并统计刷新。
  * 1.0.2：添加 GitHub 安装、更新地址和 MIT 许可元数据。
  * 1.0.1：标记、屏蔽和统计统一覆盖一级及以下；徽标显示实际等级。
  * 1.0.0：一级号标记、独立开关、设置保存、动态页面支持。
@@ -38,9 +39,11 @@
   const ranks = new Map();
   const pending = new Map();
   const queue = [];
+  const dirty = new Set();
   let active = 0;
   let scanTimer;
   let cacheTimer;
+  let statusTimer;
   let storageWarning = '';
   let settings = loadSettings();
 
@@ -154,6 +157,14 @@
     if (status.textContent !== text) status.textContent = text;
   }
 
+  function scheduleStatus() {
+    if (statusTimer !== undefined) return;
+    statusTimer = setTimeout(() => {
+      statusTimer = undefined;
+      updateStatus();
+    }, 50);
+  }
+
   function saveCache() {
     clearTimeout(cacheTimer);
     cacheTimer = setTimeout(() => {
@@ -174,12 +185,12 @@
   }
 
   function pump() {
-    while (active < 2 && queue.length) {
+    while (active < 4 && queue.length) {
       const task = queue.shift();
       active++;
       queryRank(task.uid).then(task.resolve).finally(() => {
-        // Space out lookups; no automatic retries or unbounded parallel requests.
-        setTimeout(() => { active--; pump(); }, 250);
+        active--;
+        pump();
       });
     }
   }
@@ -212,14 +223,16 @@
     if (record.rank === undefined) element.removeAttribute('data-nsl1-rank');
     else element.setAttribute('data-nsl1-rank', record.rank === null ? 'unknown' : String(record.rank));
     const target = record.target;
-    let badge = element.querySelector('.nsl1-badge');
+    let badge = record.badge;
     if (!isLowRank(record.rank) && record.rank !== null) {
       badge?.remove();
+      record.badge = null;
       return;
     }
     if (!badge) {
       badge = document.createElement('span');
       badge.className = 'nsl1-badge';
+      record.badge = badge;
     }
     const isLow = isLowRank(record.rank);
     const level = `Lv.${record.rank}`;
@@ -238,19 +251,20 @@
     const uid = author?.getAttribute('href')?.match(/^\/space\/(\d+)\/?(?:[?#].*)?$/)?.[1];
     const target = listItem ? element.querySelector('.post-title') : author?.parentElement;
     if (!uid || !target) {
-      records.delete(element);
-      element.removeAttribute('data-nsl1-kind');
-      element.removeAttribute('data-nsl1-rank');
-      element.querySelector('.nsl1-badge')?.remove();
+      clearRecord(element);
       return;
     }
     const kind = listItem || element.parentElement.matches('.nsk-post') ? 'posts' : 'comments';
     const previous = records.get(element);
     if (previous?.uid === uid && previous.kind === kind) {
-      previous.target = target;
-      decorate(element, previous);
+      const needsBadge = isLowRank(previous.rank) || previous.rank === null;
+      if (previous.target !== target || (needsBadge && previous.badge?.parentElement !== target)) {
+        previous.target = target;
+        decorate(element, previous);
+      }
       return;
     }
+    (previous?.badge || element.querySelector('.nsl1-badge'))?.remove();
     const record = { uid, kind, target, rank: undefined };
     records.set(element, record);
     decorate(element, record);
@@ -259,34 +273,58 @@
       if (records.get(element) !== record || !element.isConnected) return;
       record.rank = rank;
       decorate(element, record);
-      updateStatus();
+      scheduleStatus();
     });
   }
 
-  function scan() {
+  function clearRecord(element) {
+    records.get(element)?.badge?.remove();
+    records.delete(element);
+    element.removeAttribute('data-nsl1-kind');
+    element.removeAttribute('data-nsl1-rank');
+  }
+
+  function flush() {
     scanTimer = undefined;
-    for (const [element] of records) {
-      if (!element.isConnected || !element.matches(SELECTOR)) {
-        records.delete(element);
-        element.removeAttribute('data-nsl1-kind');
-        element.removeAttribute('data-nsl1-rank');
-        element.querySelector('.nsl1-badge')?.remove();
-      }
+    for (const element of dirty) {
+      if (element.isConnected && element.matches(SELECTOR)) inspect(element);
+      else clearRecord(element);
     }
-    document.querySelectorAll(SELECTOR).forEach(inspect);
-    updateStatus();
+    dirty.clear();
+    scheduleStatus();
+  }
+
+  function collect(element) {
+    if (records.has(element) || element.matches(SELECTOR)) dirty.add(element);
+    element.querySelectorAll(SELECTOR).forEach(item => dirty.add(item));
   }
 
   const observer = new MutationObserver(mutations => {
-    const relevant = mutations.some(mutation => {
-      const element = mutation.target.nodeType === 1 ? mutation.target : mutation.target.parentElement;
-      return !element?.closest('#nsl1-panel, .nsl1-badge') &&
-        (mutation.type === 'attributes' || [...mutation.addedNodes, ...mutation.removedNodes]
-          .some(node => node.nodeType === 1 && !node.matches('.nsl1-badge')));
-    });
-    if (relevant && scanTimer === undefined) scanTimer = setTimeout(scan, 100);
+    for (const mutation of mutations) {
+      const target = mutation.target;
+      if (target.closest('#nsl1-panel, .nsl1-badge')) continue;
+      if (mutation.type === 'attributes') {
+        const item = target.closest(SELECTOR);
+        if (item) dirty.add(item);
+        continue;
+      }
+      let changed = false;
+      for (const nodes of [mutation.addedNodes, mutation.removedNodes]) {
+        for (const node of nodes) {
+          if (node.nodeType !== 1 || node.matches('.nsl1-badge')) continue;
+          changed = true;
+          collect(node);
+        }
+      }
+      if (changed) {
+        const item = target.closest(SELECTOR);
+        if (item) dirty.add(item);
+      }
+    }
+    if (dirty.size && scanTimer === undefined) scanTimer = setTimeout(flush, 50);
   });
   observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['href', 'id'] });
   updateSettings();
-  scan();
+  document.querySelectorAll(SELECTOR).forEach(inspect);
+  scheduleStatus();
 })();
